@@ -2,7 +2,7 @@
 // Версия протокола: клиент проверяет заголовок X-SW-Video, чтобы понять,
 // перехватывает ли SW <video>-запросы (на iOS Safari — нет, там blob-fallback).
 
-const SW_VERSION = 'sr-sw-v3';
+const SW_VERSION = 'sr-sw-v4';
 
 // Превью видео практически immutable (thumbId поста не меняется):
 // держим их в Cache Storage бессрочно + отдаём с годовыми HTTP-заголовками,
@@ -38,6 +38,10 @@ self.addEventListener('activate', (event) => {
 // ради одного гигантского Range (Safari иногда просит весь файл целиком).
 const MAX_HTTP_CHUNK = 2 * 1024 * 1024; // 2 MB на один 206-ответ
 const SW_TIMEOUT_MS = 45000;
+// Превью идут через очередь с темпом, поэтому их ответ всегда ждёт дольше,
+// чем один GetFile. 25с — с запасом на flood wait, но быстрее, чем пользователь
+// решит, что «превью не грузятся».
+const SW_THUMB_TIMEOUT_MS = 25000;
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
@@ -320,7 +324,9 @@ async function handleThumbRequest(event, url, markerIdx) {
   let cache = null;
   try {
     cache = await caches.open(THUMB_CACHE);
-    const cachedResponse = await cache.match(event.request);
+    // ignoreSearch: параметр ?r=N — это cache-buster ретрая в LazyImg,
+    // он не должен плодить отдельные записи кеша для одного превью.
+    const cachedResponse = await cache.match(event.request, { ignoreSearch: true });
     if (cachedResponse) {
       return cachedResponse;
     }
@@ -349,10 +355,24 @@ async function handleThumbRequest(event, url, markerIdx) {
       return resolve(new Response(null, { status: 404 }));
     }
 
+    // Страховка от вечного «пустого» превью: если вкладка не ответила
+    // (flood wait, потерянное соединение, клиент не авторизован), <img>
+    // не должен висеть в ожидании вечно — отдаём 404, LazyImg переспросит.
+    let settled = false;
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(val);
+    };
+    const timer = setTimeout(() => {
+      finish(resolve, new Response(null, { status: 404, headers: { 'X-SW-Thumb': 'timeout' } }));
+    }, SW_THUMB_TIMEOUT_MS);
+
     const messageChannel = new MessageChannel();
     messageChannel.port1.onmessage = async (msgEvent) => {
       if (msgEvent.data.error || !msgEvent.data.chunk) {
-        resolve(new Response(null, { status: 404 }));
+        finish(resolve, new Response(null, { status: 404 }));
       } else {
         // Полный набор «долгих» заголовков: дисковый HTTP-кеш отдаёт
         // превью год без ревалидации даже мимо SW. ETag стабильный —
@@ -372,12 +392,16 @@ async function handleThumbRequest(event, url, markerIdx) {
             'Cache-Control': 'public, max-age=31536000, immutable'
           }
         });
-        resolve(response);
+        finish(resolve, response);
         // Кладём в Cache Storage в фоне, чтобы не задерживать <img>.
         // Имя кеша не версионируем — превью переживают обновления SW.
         try {
           if (cache) {
-            await cache.put(event.request, response.clone());
+            // Ключ кеша — чистый URL без cache-buster'а ретрая и без
+            // условных заголовков оригинального запроса (cache.put
+            // чувствителен к Range/If-None-Match).
+            const cacheKey = new Request(url.origin + url.pathname);
+            await cache.put(cacheKey, response.clone());
             await trimCache(cache, MAX_THUMBS);
           }
         } catch (_) {}
@@ -391,7 +415,7 @@ async function handleThumbRequest(event, url, markerIdx) {
         messageId
       }, [messageChannel.port2]);
     } catch (_) {
-      resolve(new Response(null, { status: 404 }));
+      finish(resolve, new Response(null, { status: 404 }));
     }
   });
 }
