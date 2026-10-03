@@ -194,6 +194,64 @@ function videoHeaders(start, end, fileSize, extra = {}) {
 // и ловило flood wait на аккаунте. 64 GB — с запасом выше любой реальной записи.
 const MAX_FILE_SIZE = 64 * 1024 * 1024 * 1024;
 
+// Размер блока, который вкладка читает из Telegram. Ровно тот же, что
+// STREAM_CHUNK_UPPER_LIMIT в tweb (stream.ts:70): на мобильном Safari
+// видео крупнее ~75 МБ не стартует, если раздавать его блоками по 512 КБ,
+// поэтому для больших файлов нужен блок 1 МБ.
+const TAIL_PRIME_BYTES = 1024 * 1024;
+
+// Уже отправленные «проталкивания» хвоста: по одному на файл.
+const primedTails = new Set();
+
+// Safari перед воспроизведением шлёт пробный Range: bytes=0-1 и требует на
+// него честный 206 с range-заголовками, иначе источник отбрасывается.
+// Настоящее чтение из Telegram на такую пробу не успевает (уходит в
+// таймаут), поэтому отвечаем мгновенно двумя нулевыми байтами — дальше
+// Safari переспросит нужный диапазон сам. Так же поступает tweb
+// (stream.ts:368 responseForSafariFirstRange).
+function responseForSafariProbe(rangeHeader, fileSize) {
+  if (!rangeHeader) return null;
+  if (!/^\s*bytes\s*=\s*0\s*-\s*1\s*$/i.test(rangeHeader)) return null;
+  return new Response(new Uint8Array(2).buffer, {
+    status: 206,
+    statusText: 'Partial Content',
+    headers: {
+      'Accept-Ranges': 'bytes',
+      'Content-Range': `bytes 0-1/${fileSize || '*'}`,
+      'Content-Length': '2',
+      'Content-Type': 'video/mp4',
+      'Cache-Control': 'no-store',
+      'X-SW-Video': SW_VERSION,
+    },
+  });
+}
+
+// mp4 от Telegram не faststart: moov-атом с длительностью лежит в конце
+// файла. Safari не начнёт играть, пока не увидит его, поэтому при первом
+// обращении к файлу фоном подтягиваем хвост (tweb делает то же в
+// stream.ts:195-206). Сообщение уходит вкладке без MessageChannel: ответ
+// не нужен, нужен только прогрев LRU-кеша блоков.
+function primeTailChunk(client, chatId, messageId, fileSize) {
+  if (!client || !Number.isFinite(fileSize) || fileSize <= TAIL_PRIME_BYTES) return;
+  const key = `${chatId}/${messageId}/${fileSize}`;
+  if (primedTails.has(key)) return;
+  primedTails.add(key);
+  // Ограничиваем память: карта живёт весь сеанс SW.
+  if (primedTails.size > 200) {
+    const first = primedTails.values().next().value;
+    primedTails.delete(first);
+  }
+  try {
+    client.postMessage({
+      type: 'prime-tg-chunk',
+      chatId,
+      messageId,
+      start: Math.max(0, fileSize - TAIL_PRIME_BYTES),
+      end: fileSize - 1,
+    });
+  } catch (_) {}
+}
+
 async function handleVideoRequest(event, url, markerIdx, client) {
   // Format: <base>/tg-video/<chatId>/<messageId>/<size>
   const parts = url.pathname.slice(markerIdx).split('/');
@@ -219,6 +277,9 @@ async function handleVideoRequest(event, url, markerIdx, client) {
   if (event.request.method !== 'GET') {
     return new Response(null, { status: 405 });
   }
+
+  const probe = responseForSafariProbe(event.request.headers.get('Range'), fileSize);
+  if (probe) return probe;
 
   // Режим скачивания целиком (?download=1): потоковая отдача всего файла.
   if (url.searchParams.has('download')) {
@@ -275,6 +336,11 @@ async function handleVideoRequest(event, url, markerIdx, client) {
   if (end - start + 1 > MAX_HTTP_CHUNK) {
     end = start + MAX_HTTP_CHUNK - 1;
   }
+
+  // Первое касание файла — заранее тянем хвост, где лежит moov.
+  // Для десктопа это просто лишний фоновый GetFile, для Safari без него
+  // playback может не стартовать вовсе.
+  if (start === 0) primeTailChunk(client, chatId, messageId, fileSize);
 
   try {
     const chunk = await requestChunkFromMainThread(event, client, chatId, messageId, start, end);
