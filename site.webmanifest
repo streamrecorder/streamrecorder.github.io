@@ -1,0 +1,23 @@
+{
+  "name": "StreamRecorder Client",
+  "short_name": "StreamRecorder",
+  "description": "Архив Twitch/Kick-стримов с синхронизированным чатом. Видео лежит в Telegram, стримится напрямую в браузер.",
+  "lang": "ru",
+  "dir": "ltr",
+  "start_url": "./",
+  "scope": "./",
+  "id": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0e0e10",
+  "theme_color": "#0e0e10",
+  "categories": ["video", "entertainment", "social"],
+  "icons": [
+    {
+      "src": "./images/pwa.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

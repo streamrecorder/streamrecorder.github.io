@@ -2,13 +2,16 @@
 // Версия протокола: клиент проверяет заголовок X-SW-Video, чтобы понять,
 // перехватывает ли SW <video>-запросы (на iOS Safari — нет, там blob-fallback).
 
-const SW_VERSION = 'sr-sw-v4';
+// Версия протокола. Поднимается при несовместимых изменениях: клиент
+// сверяется с ней по заголовку X-SW-Video, а activate вычищает старые
+// кеши (см. THUMB_CACHE/STATIC_CACHE).
+const SW_VERSION = 'sr-sw-v5';
 
 // Превью видео практически immutable (thumbId поста не меняется):
 // держим их в Cache Storage бессрочно + отдаём с годовыми HTTP-заголовками,
 // чтобы работал и дисковый HTTP-кеш браузера. Лимит — защита от переполнения
 // квоты (иначе браузер может снести всё origin-хранилище целиком).
-const THUMB_CACHE = 'tg-thumbs';
+const THUMB_CACHE = 'tg-thumbs-v5';
 const MAX_THUMBS = 1000;
 // Статика (аватарки каналов, бейджи, иконки): cache-first в SW,
 // чтобы долгий кеш не зависел от заголовков хостинга.
@@ -26,7 +29,13 @@ self.addEventListener('activate', (event) => {
       const names = await caches.keys();
       await Promise.all(
         names
+          // Статика: чистим прошлые версии.
           .filter((n) => n.startsWith('sr-static-') && n !== STATIC_CACHE)
+          // Превью: чистим прошлые версии тоже. Раньше в фильтре стоял
+          // только sr-static-*, из-за чего tg-thumbs жил вечно и переживал
+          // выход из аккаунта — следующий человек за тем же браузером
+          // получал превью чужих закрытых каналов из кеша.
+          .filter((n) => n.startsWith('tg-thumbs') && n !== THUMB_CACHE)
           .map((n) => caches.delete(n))
       );
     } catch (_) {}
@@ -43,15 +52,49 @@ const SW_TIMEOUT_MS = 45000;
 // решит, что «превью не грузятся».
 const SW_THUMB_TIMEOUT_MS = 25000;
 
+// Окно нашего origin под нашим управлением — единственное, которому
+// отдаём байты из Telegram. По спецификации SW и так не видит запросы
+// неконтролируемых клиентов (проверено: cross-origin fetch с чужого
+// сайта уходит в сеть, минуя SW), но явная проверка закрывает остаток:
+// обращение к чужому хосту с путём /tg-video/ из нашей вкладки, а также
+// подмену клиента в matchAll.
+async function pickRequestingClient(event) {
+  const id = event.clientId || event.resultingClientId;
+  if (!id) return null;
+  try {
+    const client = await self.clients.get(id);
+    if (!client || client.type !== 'window') return null;
+    if (!(client.url || '').startsWith(self.registration.scope)) return null;
+    return client;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function guardOwnClient(event, handler) {
+  const client = await pickRequestingClient(event);
+  if (!client) {
+    return new Response(null, {
+      status: 403,
+      headers: { 'X-SW-Video': SW_VERSION },
+    });
+  }
+  return handler(client);
+}
+
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  // Маркер ищем внутри пути, а не с начала: билд может лежать в подпути (/client/).
-  const videoIdx = url.pathname.indexOf('/tg-video/');
-  const thumbIdx = url.pathname.indexOf('/tg-thumb/');
+  // Прокси-маркеры ищем только внутри СВОЕГО origin: иначе запрос с
+  // нашей вкладки к чужому хосту, у которого в пути есть /tg-video/,
+  // перехватывался бы нашим SW. Внутри пути, а не с начала: билд может
+  // лежать в подпути (/client/).
+  const isOurs = url.origin === self.location.origin;
+  const videoIdx = isOurs ? url.pathname.indexOf('/tg-video/') : -1;
+  const thumbIdx = isOurs ? url.pathname.indexOf('/tg-thumb/') : -1;
   if (videoIdx !== -1) {
-    event.respondWith(handleVideoRequest(event, url, videoIdx));
+    event.respondWith(guardOwnClient(event, (client) => handleVideoRequest(event, url, videoIdx, client)));
   } else if (thumbIdx !== -1) {
-    event.respondWith(handleThumbRequest(event, url, thumbIdx));
+    event.respondWith(guardOwnClient(event, (client) => handleThumbRequest(event, url, thumbIdx, client)));
   } else if (isCacheableStatic(url, event.request)) {
     event.respondWith(handleStaticRequest(event));
   }
@@ -137,21 +180,28 @@ function videoHeaders(start, end, fileSize, extra = {}) {
     'Content-Length': String(end - start + 1),
     'Content-Type': 'video/mp4',
     'Cache-Control': 'no-store',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges',
+    // Без Access-Control-Allow-Origin. Ответы SW не нужны чужим origin'ам:
+    // видео всегда запрашивает наша же вкладка, а wildcard-CORS делал
+    // байты читаемыми из любого контекста, куда ответ попал.
     'X-SW-Video': SW_VERSION,
     ...extra,
   };
 }
 
-async function handleVideoRequest(event, url, markerIdx) {
+// Потолок на размер, заявленный в URL. Размер приходит из пути и в
+// ?download=1 управляет циклом GetFile: без проверки подставленное
+// в URL число гоняло бы вкладку в бесконечный цикл запросов к Telegram
+// и ловило flood wait на аккаунте. 64 GB — с запасом выше любой реальной записи.
+const MAX_FILE_SIZE = 64 * 1024 * 1024 * 1024;
+
+async function handleVideoRequest(event, url, markerIdx, client) {
   // Format: <base>/tg-video/<chatId>/<messageId>/<size>
   const parts = url.pathname.slice(markerIdx).split('/');
   const chatId = parts[2];
   const messageId = parseInt(parts[3], 10);
   const fileSize = parseInt(parts[4], 10);
 
-  if (!chatId || !Number.isFinite(messageId) || !Number.isFinite(fileSize) || fileSize <= 0) {
+  if (!chatId || !Number.isFinite(messageId) || !Number.isFinite(fileSize) || fileSize <= 0 || fileSize > MAX_FILE_SIZE) {
     return new Response('Bad tg-video URL', { status: 400 });
   }
   if (event.request.method === 'HEAD') {
@@ -162,7 +212,6 @@ async function handleVideoRequest(event, url, markerIdx) {
         'Content-Length': String(fileSize),
         'Content-Type': 'video/mp4',
         'Cache-Control': 'no-store',
-        'Access-Control-Allow-Origin': '*',
         'X-SW-Video': SW_VERSION,
       },
     });
@@ -181,7 +230,7 @@ async function handleVideoRequest(event, url, markerIdx) {
           while (currentStart < fileSize) {
             if (event.request.signal.aborted) break;
             const end = Math.min(currentStart + MAX_HTTP_CHUNK - 1, fileSize - 1);
-            const chunk = await requestChunkFromMainThread(event, chatId, messageId, currentStart, end);
+            const chunk = await requestChunkFromMainThread(event, client, chatId, messageId, currentStart, end);
             controller.enqueue(new Uint8Array(chunk));
             currentStart = end + 1;
           }
@@ -201,7 +250,6 @@ async function handleVideoRequest(event, url, markerIdx) {
         'Content-Length': fileSize.toString(),
         'Content-Disposition': 'attachment',
         'Cache-Control': 'no-store',
-        'Access-Control-Allow-Origin': '*',
         'X-SW-Video': SW_VERSION,
       }
     });
@@ -229,7 +277,7 @@ async function handleVideoRequest(event, url, markerIdx) {
   }
 
   try {
-    const chunk = await requestChunkFromMainThread(event, chatId, messageId, start, end);
+    const chunk = await requestChunkFromMainThread(event, client, chatId, messageId, start, end);
     return new Response(chunk, {
       status: 206,
       headers: videoHeaders(start, end, fileSize),
@@ -247,26 +295,9 @@ async function handleVideoRequest(event, url, markerIdx) {
   }
 }
 
-function requestChunkFromMainThread(event, chatId, messageId, start, end) {
-  return new Promise(async (resolve, reject) => {
-    let clients = [];
-    try {
-      // Сначала — именно та вкладка, чей <video> запросил чанк.
-      if (event.clientId) {
-        const client = await self.clients.get(event.clientId);
-        if (client) clients = [client];
-      }
-      if (clients.length === 0) {
-        clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-      }
-    } catch (_) {
-      try {
-        clients = await self.clients.matchAll({ type: 'window' });
-      } catch (__) {
-        clients = [];
-      }
-    }
-    if (clients.length === 0) {
+function requestChunkFromMainThread(event, client, chatId, messageId, start, end) {
+  return new Promise((resolve, reject) => {
+    if (!client) {
       return reject(new Error('No main window available'));
     }
 
@@ -281,12 +312,12 @@ function requestChunkFromMainThread(event, chatId, messageId, start, end) {
     };
 
     const timer = setTimeout(() => {
-      try { clients[0].postMessage({ type: 'abort-tg-chunk', reqId }); } catch (_) {}
+      try { client.postMessage({ type: 'abort-tg-chunk', reqId }); } catch (_) {}
       done(reject, new Error('SW chunk timeout'));
     }, SW_TIMEOUT_MS);
 
     const abortHandler = () => {
-      try { clients[0].postMessage({ type: 'abort-tg-chunk', reqId }); } catch (_) {}
+      try { client.postMessage({ type: 'abort-tg-chunk', reqId }); } catch (_) {}
       done(reject, new Error('Aborted'));
     };
 
@@ -306,7 +337,10 @@ function requestChunkFromMainThread(event, chatId, messageId, start, end) {
     } catch (_) {}
 
     try {
-      clients[0].postMessage({
+      // Строго та вкладка, чей <video> запросил чанк. Раньше здесь был
+      // fallback на matchAll(includeUncontrolled: true) — то есть байты
+      // авторизованной сессии мог уйти в любое окно этого origin.
+      client.postMessage({
         type: 'fetch-tg-chunk',
         reqId,
         chatId,
@@ -320,7 +354,7 @@ function requestChunkFromMainThread(event, chatId, messageId, start, end) {
   });
 }
 
-async function handleThumbRequest(event, url, markerIdx) {
+async function handleThumbRequest(event, url, markerIdx, client) {
   let cache = null;
   try {
     cache = await caches.open(THUMB_CACHE);
@@ -337,21 +371,12 @@ async function handleThumbRequest(event, url, markerIdx) {
   const parts = url.pathname.slice(markerIdx).split('/');
   const chatId = parts[2];
   const messageId = parseInt(parts[3], 10);
+  if (!chatId || !Number.isFinite(messageId) || messageId <= 0) {
+    return new Response(null, { status: 400 });
+  }
 
-  return new Promise(async (resolve) => {
-    let clients = [];
-    try {
-      if (event.clientId) {
-        const client = await self.clients.get(event.clientId);
-        if (client) clients = [client];
-      }
-      if (clients.length === 0) {
-        clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-      }
-    } catch (_) {
-      clients = [];
-    }
-    if (clients.length === 0) {
+  return new Promise((resolve) => {
+    if (!client) {
       return resolve(new Response(null, { status: 404 }));
     }
 
@@ -389,12 +414,15 @@ async function handleThumbRequest(event, url, markerIdx) {
             'Expires': new Date(now.getTime() + 31536000 * 1000).toUTCString(),
             'Last-Modified': now.toUTCString(),
             'ETag': `"tg-${chatId}-${messageId}"`,
-            'Cache-Control': 'public, max-age=31536000, immutable'
+            // private: превью закрытых каналов не должны попадать в
+            // общий дисковый HTTP-кеш браузера.
+            'Cache-Control': 'private, max-age=31536000, immutable'
           }
         });
         finish(resolve, response);
         // Кладём в Cache Storage в фоне, чтобы не задерживать <img>.
-        // Имя кеша не версионируем — превью переживают обновления SW.
+        // Имя кеша версионировано: при смене версии activate вычистит
+        // старый tg-thumbs, а logout на странице сносит кеш целиком.
         try {
           if (cache) {
             // Ключ кеша — чистый URL без cache-buster'а ретрая и без
@@ -409,7 +437,7 @@ async function handleThumbRequest(event, url, markerIdx) {
     };
 
     try {
-      clients[0].postMessage({
+      client.postMessage({
         type: 'fetch-tg-thumb',
         chatId,
         messageId
